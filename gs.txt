@@ -1,0 +1,944 @@
+// ═══════════════════════════════════════════════════════
+// FANTASY LIGA — Google Apps Script Backend
+// ═══════════════════════════════════════════════════════
+
+const SPREADSHEET_ID = '1Bnd4HDih5xzoAYUlgJ3zFkT2Cqp_YfFTTfIwx8rvUU8';
+function getSpreadsheet() {
+  return SpreadsheetApp.openById(SPREADSHEET_ID);
+}
+
+// ═══════════════════════════════════════════════════════
+// CORS + ROUTING
+// ═══════════════════════════════════════════════════════
+
+function doGet(e) {
+  const sheet = e.parameter.sheet;
+  const action = e.parameter.action;
+
+  if (action === 'get' && sheet) {
+    const data = getSheet(sheet);
+    return jsonResponse({ success: true, data: data });
+  }
+
+  if (action === 'getAll') {
+    const sheets = [
+      'Managers','Jugadores','Partidos','Torneos','Intercambios','Ventas',
+      'Historial_Movimientos','Subastas','Picks','Bonificadores','Plantillas',
+      'Rendimiento','Alineaciones','Premios','Config','Subidas_Valor_Torneo','Quiniela'
+    ];
+    const out = {};
+    sheets.forEach(name => { out[name] = getSheet(name); });
+    return jsonResponse({ success: true, data: out });
+  }
+
+  return HtmlService.createHtmlOutputFromFile('index')
+    .setTitle('Fifa Fantasy League')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+function doPost(e) {
+  try {
+    const body = JSON.parse(e.postData.contents);
+
+    // Mensajes entrantes de Telegram (no traen 'action', traen 'message')
+    if (body.message) {
+      return jsonResponse(procesarMensajeTelegram(body.message));
+    }
+
+    const { action, sheet, id, data } = body;
+
+    if (!action) {
+      return jsonResponse({ success: false, error: 'Faltan parámetros' });
+    }
+
+    // Acciones estándar
+    if (action === 'add') {
+      const result = addRow(sheet, data);
+      return jsonResponse({ success: true, result });
+    }
+
+    if (action === 'update') {
+      const result = updateRow(sheet, id, data);
+      return jsonResponse({ success: true, result });
+    }
+
+    if (action === 'delete') {
+      const result = deleteRow(sheet, id);
+      return jsonResponse({ success: true, result });
+    }
+
+    if (action === 'deleteByFields') {
+  Logger.log('deleteByFields llamado con: ' + JSON.stringify(body.fields));
+  const result = deleteRowByFields(sheet, body.fields);
+  return jsonResponse({ success: true, result });
+}
+
+if (action === 'cerrar_subasta') {
+      const result = cerrarSubastaServer(body.subastaId);
+      return jsonResponse(result);
+    }
+
+    if (action === 'cambiar_tiempo_subastas') {
+      const result = cambiarTiempoSubastasServer(body.horas);
+      return jsonResponse(result);
+    }
+
+    if (action === 'delete_partidos_torneo') {
+      const torneoId = body.ID_Torneo || (data && data.ID_Torneo);
+      if (!torneoId) {
+        return jsonResponse({ success: false, error: 'ID_Torneo no proporcionado' });
+      }
+      const operacion = deletePartidosPorTorneo(torneoId);
+      if (operacion.success) {
+        return jsonResponse({ success: true, borrados: operacion.count });
+      } else {
+        return jsonResponse({ success: false, error: operacion.error });
+      }
+    }
+
+    return jsonResponse({ success: false, error: `Acción desconocida: ${action}` });
+
+  } catch (err) {
+    return jsonResponse({ success: false, error: err.message });
+  }
+}
+
+function doAction(action, sheet, payload) {
+  try {
+    const { id, data, fields, subastaId, ID_Torneo, managerId, mensaje, tipo, partidoIds, torneoId } = payload || {};
+
+    if (!action) return { success: false, error: 'Faltan parámetros' };
+
+    // Soporte nativo para carga completa inmediata sin depender de fetch HTTP
+    if (action === 'getAll') {
+      const sheets = [
+        'Managers','Jugadores','Partidos','Torneos','Intercambios','Ventas',
+        'Historial_Movimientos','Subastas','Picks','Bonificadores','Plantillas',
+        'Rendimiento','Alineaciones','Premios','Config','Subidas_Valor_Torneo','Quiniela','XI_Jornada'
+      ];
+      const out = {};
+      sheets.forEach(name => { out[name] = getSheet(name); });
+      return { success: true, data: out };
+    }
+
+    if (action === 'notificarTelegram') {
+      enviarNotificacionManager(managerId, mensaje, tipo);
+      return { success: true };
+    }
+
+    if (action === 'add') return { success: true, result: addRow(sheet, data) };
+    if (action === 'update') return { success: true, result: updateRow(sheet, id, data) };
+    if (action === 'delete') return { success: true, result: deleteRow(sheet, id) };
+    if (action === 'deleteByFields') {
+      Logger.log('deleteByFields llamado con: ' + JSON.stringify(fields));
+      return { success: true, result: deleteRowByFields(sheet, fields) };
+    }
+    if (action === 'cerrar_subasta') return cerrarSubastaServer(subastaId);
+    if (action === 'cambiar_tiempo_subastas') return cambiarTiempoSubastasServer(payload.horas);
+    if (action === 'delete_partidos_torneo') {
+      const tId = ID_Torneo || (data && data.ID_Torneo);
+      if (!tId) return { success: false, error: 'ID_Torneo no proporcionado' };
+      const op = deletePartidosPorTorneo(tId);
+      return op.success ? { success: true, borrados: op.count } : { success: false, error: op.error };
+    }
+
+    // 👉 NUEVO: Borrado masivo de rendimiento al eliminar un torneo
+    if (action === 'delete_rendimiento_torneo') {
+      const tId = torneoId || ID_Torneo;
+      return eliminarRendimientoDeTorneo(partidoIds, tId);
+    }
+
+    return { success: false, error: `Acción desconocida: ${action}` };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
+function cambiarTiempoSubastasServer(horas) {
+  const ss = getSpreadsheet();
+  const sheet = ss.getSheetByName('Subastas');
+  if (!sheet) return { success: false, error: "Hoja 'Subastas' no encontrada" };
+
+  const data = sheet.getDataRange().getValues();
+  if (data.length <= 1) return { success: true, count: 0 };
+
+  const headers = data[0].map(h => String(h).trim());
+  const finIdx = headers.indexOf('Timestamp_Fin');
+  const durIdx = headers.indexOf('Duracion_Horas');
+  const estIdx = headers.indexOf('Estado');
+
+  const nuevoFin = Date.now() + (parseFloat(horas) || 24) * 3600000;
+  let count = 0;
+
+  for (let i = 1; i < data.length; i++) {
+    if (estIdx === -1 || String(data[i][estIdx]).trim() === 'activa') {
+      if (finIdx > -1) sheet.getRange(i + 1, finIdx + 1).setValue(nuevoFin);
+      if (durIdx > -1) sheet.getRange(i + 1, durIdx + 1).setValue(horas);
+      count++;
+    }
+  }
+
+  return { success: true, count: count };
+}
+
+function deletePartidosPorTorneo(torneoId) {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName('Partidos');
+    
+    if (!sheet) {
+      return { success: false, error: "No se encontró la pestaña 'Partidos'" };
+    }
+
+    const rows = sheet.getDataRange().getValues();
+    if (rows.length <= 1) return { success: true, count: 0 }; 
+
+    const idBuscar = String(torneoId).trim();
+    let count = 0;
+
+    for (let i = rows.length - 1; i >= 1; i--) {
+      const idEnFila = String(rows[i][1]).trim();
+      if (idEnFila === idBuscar) {
+        sheet.deleteRow(i + 1);
+        count++;
+      }
+    }
+    
+    return { success: true, count: count };
+  } catch (e) {
+    return { success: false, error: e.toString() };
+  }
+}
+
+function jsonResponse(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// Procesa un mensaje entrante del bot de Telegram
+function procesarMensajeTelegram(message) {
+  try {
+    const chatId = message.chat && message.chat.id;
+    const texto = String(message.text || '').trim();
+    if (!chatId) return { success: false };
+
+    if (texto.indexOf('/start') === 0) {
+      const managerId = texto.split(' ')[1];
+      if (managerId) {
+        try {
+          updateRow('Managers', managerId, { Telegram_ChatID: String(chatId) });
+          enviarMensajeTelegram(chatId, '✅ Cuenta vinculada correctamente. A partir de ahora recibirás aquí tus avisos de FantasyLiga.');
+        } catch (e) {
+          enviarMensajeTelegram(chatId, '⚠️ No se pudo vincular tu cuenta. Vuelve a pulsar el botón desde tu perfil en la web.');
+        }
+      }
+    }
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err.toString() };
+  }
+}
+
+// Envía un mensaje por Telegram a un chat_id concreto (se reutilizará en la Fase 5)
+function enviarMensajeTelegram(chatId, texto) {
+  const token = PropertiesService.getScriptProperties().getProperty('TELEGRAM_BOT_TOKEN');
+  if (!token) return;
+  UrlFetchApp.fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify({ chat_id: chatId, text: texto }),
+    muteHttpExceptions: true
+  });
+}
+
+// Envía una notificación a un manager por Telegram, si la tiene vinculada. Nunca lanza error hacia arriba.
+function enviarNotificacionManager(managerId, mensaje, tipo) {
+  try {
+    const m = getSheet('Managers').find(mm => String(mm.ID) === String(managerId));
+    if (!m || !m.Telegram_ChatID) return;
+
+    let prefs = {};
+    try { prefs = JSON.parse(m.Telegram_Notif_Prefs || '{}'); } catch(e) { prefs = {}; }
+
+    if (prefs.activas === false) return;
+    if (tipo && prefs[tipo] === false) return;
+
+    enviarMensajeTelegram(m.Telegram_ChatID, mensaje);
+  } catch (e) {
+    // Silencioso a propósito: un fallo de Telegram nunca debe romper el cierre de la subasta
+  }
+}
+
+// Pregunta a Telegram por mensajes nuevos (sustituye al webhook, que no funciona con Apps Script)
+function revisarTelegramUpdates() {
+  const token = PropertiesService.getScriptProperties().getProperty('TELEGRAM_BOT_TOKEN');
+  if (!token) return;
+
+  const props = PropertiesService.getScriptProperties();
+  const offset = parseInt(props.getProperty('TELEGRAM_LAST_UPDATE_ID')) || 0;
+
+  const url = `https://api.telegram.org/bot${token}/getUpdates?offset=${offset + 1}&timeout=0`;
+  const res = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+  const data = JSON.parse(res.getContentText());
+
+  if (!data.ok || !data.result || !data.result.length) return;
+
+  let maxId = offset;
+  data.result.forEach(update => {
+    if (update.update_id > maxId) maxId = update.update_id;
+    if (update.message) procesarMensajeTelegram(update.message);
+  });
+
+  props.setProperty('TELEGRAM_LAST_UPDATE_ID', String(maxId));
+}
+
+// Instalador — ejecutar UNA SOLA VEZ desde el editor (desplegable de arriba ▶ Ejecutar)
+function crearTriggerTelegram() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'revisarTelegramUpdates') ScriptApp.deleteTrigger(t);
+  });
+
+  ScriptApp.newTrigger('revisarTelegramUpdates')
+    .timeBased()
+    .everyMinutes(1)
+    .create();
+
+  Logger.log('Trigger de Telegram creado correctamente');
+}
+
+// ═══════════════════════════════════════════════════════
+// GET — Leer hoja completa como array de objetos
+// ═══════════════════════════════════════════════════════
+
+function getSheet(sheetName) {
+  const ss = getSpreadsheet();
+  const sheet = ss.getSheetByName(sheetName);
+
+  if (!sheet) return [];
+
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) return [];
+
+  const headers = values[0].map(h => String(h).trim());
+  const rows = [];
+
+  for (let i = 1; i < values.length; i++) {
+    const row = values[i];
+    if (row.every(cell => cell === '' || cell === null || cell === undefined)) continue;
+
+    const obj = {};
+    headers.forEach((h, idx) => {
+      obj[h] = row[idx] !== undefined && row[idx] !== null ? String(row[idx]) : '';
+    });
+    rows.push(obj);
+  }
+
+  return rows;
+}
+
+// ═══════════════════════════════════════════════════════
+// ADD — Añadir fila nueva
+// ═══════════════════════════════════════════════════════
+
+function addRow(sheetName, data) {
+  const ss = getSpreadsheet();
+  const sheet = ss.getSheetByName(sheetName);
+
+  if (!sheet) throw new Error(`Hoja no encontrada: ${sheetName}`);
+
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0]
+    .map(h => String(h).trim());
+
+  const newRow = headers.map(h => data[h] !== undefined ? data[h] : '');
+
+  if (sheetName === 'Config') {
+    sheet.getRange(sheet.getLastRow() + 1, 1, 1, newRow.length).setNumberFormat('@');
+  }
+
+  sheet.appendRow(newRow);
+
+  return { added: true, row: newRow };
+}
+
+// ═══════════════════════════════════════════════════════
+// UPDATE — Actualizar fila por ID (columna A)
+// ═══════════════════════════════════════════════════════
+
+function updateRow(sheetName, id, data) {
+  const ss = getSpreadsheet();
+  const sheet = ss.getSheetByName(sheetName);
+
+  if (!sheet) throw new Error(`Hoja no encontrada: ${sheetName}`);
+
+  const allValues = sheet.getDataRange().getValues();
+  const headers = allValues[0].map(h => String(h).trim());
+
+  let targetRow = -1;
+  for (let i = 1; i < allValues.length; i++) {
+    if (String(allValues[i][0]).trim() === String(id).trim()) {
+      targetRow = i + 1;
+      break;
+    }
+  }
+
+  if (targetRow === -1) {
+    throw new Error(`ID no encontrado en ${sheetName}: ${id}`);
+  }
+
+  Object.keys(data).forEach(key => {
+    const colIndex = headers.indexOf(key);
+    if (colIndex !== -1) {
+      const range = sheet.getRange(targetRow, colIndex + 1);
+      if (sheetName === 'Config') range.setNumberFormat('@');
+      range.setValue(data[key]);
+    }
+  });
+
+  return { updated: true, id, row: targetRow };
+}
+
+// ═══════════════════════════════════════════════════════
+// DELETE — Borrar fila por ID (columna A)
+// ═══════════════════════════════════════════════════════
+
+function deleteRow(sheetName, id) {
+  const ss = getSpreadsheet();
+  const sheet = ss.getSheetByName(sheetName);
+
+  if (!sheet) throw new Error(`Hoja no encontrada: ${sheetName}`);
+
+  const allValues = sheet.getDataRange().getValues();
+
+  let targetRow = -1;
+  for (let i = 1; i < allValues.length; i++) {
+    if (String(allValues[i][0]).trim() === String(id).trim()) {
+      targetRow = i + 1;
+      break;
+    }
+  }
+
+  if (targetRow === -1) {
+    throw new Error(`ID no encontrado en ${sheetName}: ${id}`);
+  }
+
+  sheet.deleteRow(targetRow);
+  return { deleted: true, id };
+}
+
+function deleteRowByFields(sheetName, fields) {
+  const ss = getSpreadsheet();
+  const sheet = ss.getSheetByName(sheetName);
+  if (!sheet) throw new Error(`Hoja no encontrada: ${sheetName}`);
+  const allValues = sheet.getDataRange().getValues();
+  const headers = allValues[0];
+  for (let i = 1; i < allValues.length; i++) {
+    const row = allValues[i];
+    const match = Object.entries(fields).every(([key, val]) => {
+      const col = headers.indexOf(key);
+      return col > -1 && String(row[col]).trim() === String(val).trim();
+    });
+    if (match) {
+      sheet.deleteRow(i + 1);
+      return { deleted: true };
+    }
+  }
+  throw new Error(`Fila no encontrada en ${sheetName}`);
+}
+
+// ═══════════════════════════════════════════════════════
+// GESTIÓN DE ALINEACIONES
+// ═══════════════════════════════════════════════════════
+
+function guardarAlineacionServer(idManager, arrayIds, formacion, arraySuplentes) {
+  try {
+    const ss = getSpreadsheet();
+    let sheet = ss.getSheetByName('Alineaciones');
+    
+    if (!sheet) {
+      sheet = ss.insertSheet('Alineaciones');
+      sheet.appendRow(['ID_Manager', 'IDs_Once', 'Ultima_Actualizacion', 'Formacion', 'IDs_Suplentes']);
+    }
+
+    const data = sheet.getDataRange().getValues();
+    const headers = data[0].map(h => String(h).trim());
+    
+    // Asegurar que existe la cabecera IDs_Suplentes
+    let colSuplentes = headers.indexOf('IDs_Suplentes') + 1;
+    if (colSuplentes === 0) {
+      colSuplentes = 5;
+      sheet.getRange(1, colSuplentes).setValue('IDs_Suplentes');
+    }
+
+    const listaIds = (arrayIds || []).join(',');
+    const listaSuplentes = (arraySuplentes || []).join(',');
+    const formacionVal = formacion || '4-3-3';
+    let filaDestino = -1;
+
+    for (let i = 1; i < data.length; i++) {
+      if (String(data[i][0]) === String(idManager)) {
+        filaDestino = i + 1;
+        break;
+      }
+    }
+
+    if (filaDestino !== -1) {
+      sheet.getRange(filaDestino, 2).setValue(listaIds);
+      sheet.getRange(filaDestino, 3).setValue(new Date());
+      sheet.getRange(filaDestino, 4).setValue(formacionVal);
+      sheet.getRange(filaDestino, colSuplentes).setValue(listaSuplentes);
+    } else {
+      sheet.appendRow([idManager, listaIds, new Date(), formacionVal, listaSuplentes]);
+    }
+    return { success: true };
+  } catch (e) {
+    return { success: false, message: e.toString() };
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+// CIERRE ATÓMICO DE SUBASTAS (con LockService)
+// ═══════════════════════════════════════════════════════
+
+function cerrarSubastaServer(subastaId) {
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(30000);
+  } catch (e) {
+    return { success: false, error: 'No se pudo obtener el bloqueo de subasta' };
+  }
+
+  try {
+    const ss = getSpreadsheet();
+    const sheet = ss.getSheetByName('Subastas');
+    if (!sheet) return { success: false, error: "Hoja 'Subastas' no encontrada" };
+
+    const data = sheet.getDataRange().getValues();
+    const headers = data[0].map(h => String(h).trim());
+    const idIdx = headers.indexOf('ID');
+    const jugIdx = headers.indexOf('ID_Jugador');
+    const pujasIdx = headers.indexOf('Pujas_JSON');
+    const tipoIdx = headers.indexOf('Tipo');
+    const vendIdx = headers.indexOf('ID_Vendedor');
+    const estIdx = headers.indexOf('Estado');
+
+    let targetRow = -1;
+    let subRow = null;
+
+    for (let i = 1; i < data.length; i++) {
+      if (String(data[i][idIdx]).trim() === String(subastaId).trim()) {
+        targetRow = i + 1;
+        subRow = data[i];
+        break;
+      }
+    }
+
+    if (targetRow === -1) {
+      return { success: true, alreadyClosed: true, error: 'Subasta no encontrada o ya cerrada' };
+    }
+
+    // Guarda de idempotencia: si ya no está activa, devolver alreadyClosed
+    const estActual = estIdx > -1 ? String(subRow[estIdx] || '').trim().toLowerCase() : '';
+    if (estActual && estActual !== 'activa' && estActual !== 'en_subasta') {
+      return { success: true, alreadyClosed: true, error: 'Subasta ya cerrada' };
+    }
+
+    const jid = String(subRow[jugIdx]);
+    let pujas = [];
+    try { pujas = JSON.parse(subRow[pujasIdx] || '[]'); } catch(e) { pujas = []; }
+    const tipoSubasta = tipoIdx > -1 ? String(subRow[tipoIdx]) : 'sistema';
+    const vendedorId = vendIdx > -1 ? String(subRow[vendIdx]) : '';
+
+    const resultado = { success: true, subastaId, jugadorId: jid };
+
+    let pujaGanadora = null;
+    if (pujas.length > 0) {
+      const pujasOrdenadas = [...pujas].sort((a,b) => b.cantidad - a.cantidad);
+      const managers = getSheet('Managers');
+      for (const p of pujasOrdenadas) {
+        const m = managers.find(mm => String(mm.ID) === String(p.managerId));
+        if (m && (parseFloat(m.Presupuesto) || 0) >= p.cantidad) {
+          pujaGanadora = p;
+          break;
+        }
+      }
+    }
+
+    if (pujaGanadora) {
+      const ganadorId = String(pujaGanadora.managerId);
+      const precio = parseFloat(pujaGanadora.cantidad);
+      const plantillas = getSheet('Plantillas');
+      const totalPlantilla = plantillas.filter(p => String(p.ID_Manager) === ganadorId).length;
+
+      if (totalPlantilla >= 26) {
+        resultado.sinCupo = true;
+        enviarNotificacionManager(ganadorId, `⚠️ Ganaste la subasta de ${jid} por ${precio}M€, pero tu plantilla está llena (26/26).`, 'subasta_jugador');
+      } else {
+        const fechaHoy = new Date().toISOString().slice(0, 10);
+        const managerRow = getSheet('Managers').find(m => String(m.ID) === ganadorId);
+        const nombreGanador = managerRow ? (managerRow.Nombre_Equipo || managerRow.Nombre || '') : '';
+
+        // Añadir a Plantillas
+        addRow('Plantillas', { ID_Manager: ganadorId, ID_Jugador: jid, Fecha_Fichaje: fechaHoy, Procedencia: 'subasta' });
+
+        // Actualizar Jugador
+        const nowIso = new Date().toISOString();
+        updateRow('Jugadores', jid, {
+          Estado: 'fichado',
+          Manager_Asignado: ganadorId,
+          Fecha_Ultimo_Fichaje: nowIso,
+          Clausula_Porcentaje: 100,
+          Clausula_Valor_Base: precio,
+          Clausula_Fecha_Cambio: ''
+        });
+
+        // Cobrar al comprador
+        const nuevoPres = Math.round(((parseFloat(managerRow?.Presupuesto) || 0) - precio) * 10) / 10;
+        updateRow('Managers', ganadorId, { Presupuesto: nuevoPres });
+
+        // Pagar al vendedor si era de un manager
+        if (tipoSubasta === 'manager' && vendedorId && vendedorId !== ganadorId) {
+          const vendRow = getSheet('Managers').find(m => String(m.ID) === vendedorId);
+          if (vendRow) {
+            const nuevoPresVend = Math.round(((parseFloat(vendRow.Presupuesto) || 0) + precio) * 10) / 10;
+            updateRow('Managers', vendedorId, { Presupuesto: nuevoPresVend });
+            enviarNotificacionManager(vendedorId, `💰 Tu jugador en subasta se ha vendido por ${precio}M€ a ${nombreGanador}.`, 'subasta_jugador');
+          }
+        }
+
+        // Registrar en Historial_Movimientos con la cifra exacta
+        const origenNombre = tipoSubasta === 'manager' && vendedorId ? (getSheet('Managers').find(m=>String(m.ID)===vendedorId)?.Nombre_Equipo || vendedorId) : 'Agente Libre';
+        addRow('Historial_Movimientos', {
+          ID: 'MOV' + Date.now() + '_' + jid,
+          ID_Jugador: jid,
+          Tipo: 'Subasta',
+          De_ID: vendedorId || '',
+          De_Nombre: origenNombre,
+          A_ID: ganadorId,
+          A_Nombre: nombreGanador,
+          Detalle: `${precio.toFixed(1)}M€`,
+          Fecha: fechaHoy
+        });
+
+        resultado.ganadorId = ganadorId;
+        resultado.ganadorNombre = nombreGanador;
+        resultado.precio = precio;
+        enviarNotificacionManager(ganadorId, `🏆 ¡Has ganado la subasta de ${jid} por ${precio}M€!`, 'subasta_jugador');
+      }
+    } else {
+      // Sin pujas: si era de manager vuelve a 'fichado', si era del sistema a 'subasta'
+      const nuevoEst = (tipoSubasta === 'manager' && vendedorId) ? 'fichado' : 'subasta';
+      updateRow('Jugadores', jid, { Estado: nuevoEst });
+      resultado.sinPujas = true;
+    }
+
+    // Solo eliminamos la subasta si se adjudicó con éxito o se canceló sin pujas.
+    // Si hay sinCupo, NO se borra ni se completa para permitir que el manager libere espacio.
+    if (resultado.sinCupo) {
+      const estSinCupo = (tipoSubasta === 'manager' && vendedorId) ? 'fichado' : 'subasta';
+      updateRow('Jugadores', jid, { Estado: estSinCupo });
+    }
+    sheet.deleteRow(targetRow);
+
+    return resultado;
+  } catch (err) {
+    return { success: false, error: err.toString() };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+// AUTOMATIZACIÓN 100% SERVER-SIDE (no depende de que nadie
+// tenga la web abierta). Requiere haber pegado ya
+// cerrarSubastaServer() en el .gs.
+// ═══════════════════════════════════════════════════════
+
+const MAX_POS_LIBRES_SRV   = { PO: 8,  DF: 16, MC: 22, DC: 14 };
+const MAX_POS_SUBASTAS_SRV = { PO: 4,  DF: 10, MC: 12, DC: 10 };
+
+// Lee/escribe una clave del Config igual que hace el cliente (columna A = clave, 'Valor' = valor)
+function getConfigValor(clave) {
+  const ss = getSpreadsheet();
+  const sheet = ss.getSheetByName('Config');
+  const data = sheet.getDataRange().getValues();
+  const headers = data[0].map(h => String(h).trim());
+  const colValor = headers.indexOf('Valor');
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0]).trim() === clave) return data[i][colValor];
+  }
+  return null;
+}
+
+function setConfigValor(clave, valor) {
+  const ss = getSpreadsheet();
+  const sheet = ss.getSheetByName('Config');
+  const data = sheet.getDataRange().getValues();
+  const headers = data[0].map(h => String(h).trim());
+  const colValor = headers.indexOf('Valor');
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0]).trim() === clave) {
+      sheet.getRange(i + 1, colValor + 1).setValue(valor);
+      return;
+    }
+  }
+ // Si la clave no existe, añadirla
+  const newRow = headers.map((h, idx) => idx === 0 ? clave : (h === 'Valor' ? valor : ''));
+  sheet.appendRow(newRow);
+}
+
+// ── AVISO ÚNICO A 24H DEL CIERRE PROGRAMADO DEL MERCADO ──
+function revisarAviso24hCierreMercado() {
+  try {
+    const vent = ventanaStatus();
+    if (!vent.programado || !vent.tsCierre) return; // solo aplica a cierre con fecha programada, no a override manual
+
+    const restante = vent.tsCierre - Date.now();
+    const h24 = 24 * 60 * 60 * 1000;
+    if (restante <= 0 || restante > h24) return; // ya cerrado, o aún faltan más de 24h
+
+    const yaAvisadoPara = getConfigValor('Aviso24h_Enviado_Para');
+    if (String(yaAvisadoPara) === String(vent.tsCierre)) return; // ya se avisó para ESTE cierre concreto
+
+    const managers = getSheet('Managers');
+    managers.forEach(m => {
+      if (m.Telegram_ChatID) {
+        enviarNotificacionManager(m.ID, `⏰ Quedan menos de 24h para el cierre del mercado (${vent.fechaProgStr} a las 00:00).`, 'aviso_mercado');
+      }
+    });
+
+    setConfigValor('Aviso24h_Enviado_Para', String(vent.tsCierre));
+  } catch (err) {
+    Logger.log('Error revisarAviso24hCierreMercado: ' + err);
+  }
+}
+
+function crearTriggerAvisoMercado() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'revisarAviso24hCierreMercado') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('revisarAviso24hCierreMercado')
+    .timeBased()
+    .everyMinutes(15)
+    .create();
+  Logger.log('Trigger de aviso de mercado creado correctamente');
+}
+
+// ── 1. CIERRE AUTOMÁTICO DE SUBASTAS VENCIDAS ──
+// Trigger: cada 15 minutos
+function revisarYCerrarSubastasVencidas() {
+  const ahora = Date.now();
+  getSheet('Subastas').forEach(s => {
+    const fin = Number(s.Timestamp_Fin) || 0;
+    const estado = String(s.Estado || '').trim().toLowerCase();
+    if (!fin || fin > ahora) return;
+    if (estado && estado !== 'activa' && estado !== 'en_subasta') return;
+    cerrarSubastaServer(s.ID);
+  });
+}
+
+// ── 2. REGENERACIÓN AUTOMÁTICA DEL POOL DE SUBASTAS ──
+// Trigger: 1 vez al día (comprueba si ya pasaron 7 días desde el último sorteo)
+function revisarYRegenerarPoolSemanal() {
+  const SEMANA_MS = 7 * 24 * 60 * 60 * 1000;
+  const ahora = Date.now();
+
+  const ultimoSorteoSubastas = parseInt(getConfigValor('Subastas_UltimoSorteo')) || 0;
+  if (!ultimoSorteoSubastas || (ahora - ultimoSorteoSubastas) >= SEMANA_MS) {
+    regenerarPoolSubastasServer();
+  }
+
+  const ultimoSorteoLibres = parseInt(getConfigValor('Libres_UltimoSorteo')) || 0;
+  if (!ultimoSorteoLibres || (ahora - ultimoSorteoLibres) >= SEMANA_MS) {
+    regenerarLibresAleatoriosServer();
+  }
+}
+
+// ── FAVORITOS: aviso por Telegram cuando un favorito pasa a disponible (independiente de si hay sesión abierta) ──
+function revisarFavoritosDisponiblesServer() {
+  try {
+    const managers = getSheet('Managers');
+    const jugadores = getSheet('Jugadores');
+    const plantillas = getSheet('Plantillas');
+
+    let libresSeleccion = [];
+    try { libresSeleccion = JSON.parse(getConfigValor('Libres_Seleccion') || '[]'); } catch(e) { libresSeleccion = []; }
+
+    const subastasHoja = getSheet('Subastas');
+    const ahora = Date.now();
+    const idsEnSubastaActiva = new Set(
+      subastasHoja
+        .filter(s => String(s.Estado).trim() === 'activa' && (!s.Timestamp_Fin || ahora < parseInt(s.Timestamp_Fin)))
+        .map(s => String(s.ID_Jugador))
+    );
+
+    let notificados = [];
+    try { notificados = JSON.parse(getConfigValor('Favoritos_Notificados_Server') || '[]'); } catch(e) { notificados = []; }
+    const notifSet = new Set(notificados);
+
+    managers.forEach(m => {
+      const favs = (m.Favoritos || '').split(',').map(s=>s.trim()).filter(Boolean);
+      favs.forEach(jid => {
+        const clave = m.ID + '_' + jid;
+        const esMio = plantillas.some(p => String(p.ID_Jugador)===String(jid) && String(p.ID_Manager)===String(m.ID));
+        const enLibresAhora = libresSeleccion.some(id => String(id) === String(jid));
+        const enSubastaActiva = idsEnSubastaActiva.has(String(jid));
+        const disponible = (enLibresAhora || enSubastaActiva) && !esMio;
+
+        if (disponible && !notifSet.has(clave)) {
+          const j = jugadores.find(jj => String(jj.ID) === String(jid));
+          const nombreJ = j ? j.Nombre : jid;
+          const estadoLabel = enSubastaActiva ? 'en subasta' : 'disponible como agente libre';
+                    enviarNotificacionManager(m.ID, `⭐ Tu favorito ${nombreJ} está ${estadoLabel}`, 'favorito_disponible');
+          notifSet.add(clave);
+        } else if (!disponible && notifSet.has(clave)) {
+          notifSet.delete(clave); // vuelve a estar "no disponible" -> se podrá reavisar en el futuro
+        }
+      });
+    });
+
+    setConfigValor('Favoritos_Notificados_Server', JSON.stringify(Array.from(notifSet)));
+  } catch (err) {
+    Logger.log('Error revisarFavoritosDisponiblesServer: ' + err);
+  }
+}
+
+function crearTriggerFavoritos() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'revisarFavoritosDisponiblesServer') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('revisarFavoritosDisponiblesServer')
+    .timeBased()
+    .everyMinutes(15)
+    .create();
+  Logger.log('Trigger de favoritos creado correctamente');
+}
+
+function sorteoAleatorioServer(estado, cantidad) {
+  const maxPos = estado === 'libre' ? MAX_POS_LIBRES_SRV : MAX_POS_SUBASTAS_SRV;
+  const jugadores = getSheet('Jugadores');
+  const candidatos = jugadores.filter(j => j.Estado === estado);
+
+  // Shuffle
+  for (let i = candidatos.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [candidatos[i], candidatos[j]] = [candidatos[j], candidatos[i]];
+  }
+
+  const result = [];
+  const contPos = {};
+  for (const j of candidatos) {
+    const pos = j.Posicion;
+    const max = maxPos[pos] || 3;
+    if ((contPos[pos] || 0) >= max) continue;
+    contPos[pos] = (contPos[pos] || 0) + 1;
+    result.push(j);
+    if (result.length >= cantidad) break;
+  }
+  return result;
+}
+
+function regenerarPoolSubastasServer() {
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(30000);
+  } catch (e) {
+    Logger.log('No se pudo obtener el bloqueo en regenerarPoolSubastasServer');
+    return;
+  }
+
+  try {
+    const SEMANA_MS = 7 * 24 * 60 * 60 * 1000;
+    const ahora = Date.now();
+    const ultimoSorteo = parseInt(getConfigValor('Subastas_UltimoSorteo')) || 0;
+
+    // Doble comprobación dentro del lock para evitar ejecuciones concurrentes
+    if (ultimoSorteo && (ahora - ultimoSorteo) < SEMANA_MS) {
+      Logger.log('Sorteo ya realizado recientemente');
+      return;
+    }
+
+    const seleccion = sorteoAleatorioServer('subasta', 36);
+    const fin = ahora + 168 * 60 * 60 * 1000;
+
+    const ss = getSpreadsheet();
+    const sheet = ss.getSheetByName('Subastas');
+    if (!sheet) return;
+
+    // Eliminar subastas anteriores del sistema (conservando las creadas por managers)
+    const data = sheet.getDataRange().getValues();
+    if (data.length > 1) {
+      const headers = data[0].map(h => String(h).trim());
+      const tipoIdx = headers.indexOf('Tipo');
+      for (let i = data.length - 1; i >= 1; i--) {
+        if (tipoIdx > -1 && String(data[i][tipoIdx]).trim() === 'sistema') {
+          sheet.deleteRow(i + 1);
+        }
+      }
+    }
+
+    // Inserción en bloque
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(h => String(h).trim());
+    const filasNuevas = seleccion.map(j => {
+      const valor = parseFloat(j.Valor_Mercado) || 0;
+      const subObj = {
+        ID: 'SUB' + ahora.toString().slice(-6) + '_' + j.ID,
+        ID_Jugador: j.ID,
+        Tipo: 'sistema',
+        ID_Vendedor: '',
+        Precio_Base: Math.round(valor * 1.00 * 10) / 10,
+        Precio_Maximo: Math.round(valor * 1.85 * 10) / 10,
+        Puja_Actual: 0,
+        ID_Pujador_Actual: '',
+        Duracion_Horas: 168,
+        Timestamp_Inicio: ahora,
+        Timestamp_Fin: fin,
+        Estado: 'activa',
+        Notificacion_Enviada: 'FALSE',
+        Pujas_JSON: '[]'
+      };
+      return headers.map(h => subObj[h] !== undefined ? subObj[h] : '');
+    });
+
+    if (filasNuevas.length > 0) {
+      sheet.getRange(sheet.getLastRow() + 1, 1, filasNuevas.length, headers.length).setValues(filasNuevas);
+    }
+
+    setConfigValor('Subastas_UltimoSorteo', ahora.toString());
+  } catch (err) {
+    Logger.log('Error en regenerarPoolSubastasServer: ' + err);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function regenerarLibresAleatoriosServer() {
+  const seleccion = sorteoAleatorioServer('libre', 60);
+  setConfigValor('Libres_Seleccion', JSON.stringify(seleccion.map(j => j.ID)));
+  setConfigValor('Libres_UltimoSorteo', Date.now().toString());
+}
+
+// ── 3. INSTALADOR DE TRIGGERS (ejecutar UNA SOLA VEZ manualmente) ──
+// Desde el editor de Apps Script: seleccionar esta función en el desplegable
+// de arriba y pulsar ▶ Ejecutar. Solo hace falta hacerlo una vez.
+function crearTriggersAutomaticos() {
+  // Limpiar triggers previos de estas funciones para no duplicarlos
+  ScriptApp.getProjectTriggers().forEach(t => {
+    const fn = t.getHandlerFunction();
+    if (fn === 'revisarYCerrarSubastasVencidas' || fn === 'revisarYRegenerarPoolSemanal') {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+
+  ScriptApp.newTrigger('revisarYCerrarSubastasVencidas')
+    .timeBased()
+    .everyMinutes(15)
+    .create();
+
+  ScriptApp.newTrigger('revisarYRegenerarPoolSemanal')
+    .timeBased()
+    .everyDays(1)
+    .atHour(4) // se comprueba cada día a las 4am; solo actúa si ya pasaron los 7 días
+    .create();
+
+  Logger.log('Triggers creados correctamente');
+}
